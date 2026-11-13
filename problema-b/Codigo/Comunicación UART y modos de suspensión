@@ -1,0 +1,337 @@
+
+#define F_CPU 16000000UL
+#include <avr/interrupt.h>
+#include <avr/io.h>
+#include <avr/sleep.h>
+#include <avr/wdt.h>
+#include <stdint.h>
+#include <util/atomic.h>
+#include <util/delay.h>
+#include <util/twi.h>
+
+#ifndef WDT_TEST
+#define WDT_TEST 1
+#endif
+#if WDT_TEST != 1 && WDT_TEST != 2
+#error WDT_TEST debe ser 1 o 2
+#endif
+
+#define LED PB5
+#define BUZZER PD3
+#define BUTTON PD2
+#define DHT PD4
+#define EMERGENCY PB3
+#define LCD_BL 0x08
+#define LCD_E 0x04
+#define LCD_RS 0x01
+
+static uint8_t lcd_address = 0x27;
+static uint8_t lcd_backlight = LCD_BL;
+static uint8_t lcd_register = 0;
+
+#define UART_BAUD 9600UL
+#define FRAME_START 0x7E
+#define FRAME_STOP 0x7F
+#define UART_BUF_SIZE 32
+
+#define ACTIVO 0
+#define STANDBY 1
+#define APAGADO 2
+#define SEGURO 3
+
+volatile uint32_t ms = 0;
+volatile uint8_t adc_request = 0;
+volatile uint16_t adc_value = 0;
+volatile uint8_t button_pending = 0;
+volatile uint32_t button_time = 0;
+volatile uint8_t emergency_wakeup = 0;
+volatile uint8_t uart_command = 0;
+static uint8_t uart_data = 0;
+static uint8_t rx_buffer[UART_BUF_SIZE];
+static uint8_t tx_buffer[UART_BUF_SIZE];
+static volatile uint8_t rx_head = 0, rx_tail = 0;
+static volatile uint8_t tx_head = 0, tx_tail = 0;
+static volatile uint8_t rx_error = 0;
+static uint8_t frame_step = 0, frame_command = 0, frame_data = 0;
+static uint8_t frame_checksum = 0;
+static uint32_t frame_start_ms = 0;
+static uint8_t lcd_cancel_requested = 0;
+
+volatile uint8_t wdt_pending = 0;
+volatile uint8_t wdt_count = 0;
+uint16_t wdt_adc_value = 0;
+
+uint8_t reset_cause __attribute__((section(".noinit")));
+void capture_reset_cause(void) __attribute__((naked, section(".init3")));
+
+void capture_reset_cause(void) {
+    reset_cause = MCUSR;
+    MCUSR = 0;
+    wdt_disable();
+}
+
+#if WDT_TEST == 1
+static void wdt_interrupt_start(void) {
+    uint8_t sreg = SREG;
+    cli();
+    wdt_reset();
+    MCUSR &= ~(1 << WDRF);
+    __asm__ __volatile__(
+        "sts %[wdt], %[open]"
+        "\n\t"
+        "sts %[wdt], %[mode]"
+        :
+        : [wdt] "n"(_SFR_MEM_ADDR(WDTCSR)),
+          [open] "r"((uint8_t)((1 << WDCE) | (1 << WDE))),
+          [mode] "r"((uint8_t)((1 << WDIE) | (1 << WDP3) | (1 << WDP0)))
+        : "memory");
+    SREG = sreg;
+}
+ISR(WDT_vect) {
+    wdt_count++;
+    wdt_pending = 1;
+}
+static uint16_t wdt_read_adc0(void) {
+    PRR &= ~(1 << PRADC);
+    ADMUX = (1 << REFS0);
+    ADCSRA = (1 << ADEN) | (1 << ADPS2) |
+             (1 << ADPS1) | (1 << ADPS0);
+    ADCSRA |= (1 << ADSC);
+    while (ADCSRA & (1 << ADSC)) {}
+    uint16_t value = ADC;
+    ADCSRA &= ~(1 << ADEN);
+    PRR |= (1 << PRADC);
+    return value;
+}
+#endif
+
+#define DHT_IDLE 0
+#define DHT_RESPONSE_LOW 1
+#define DHT_RESPONSE_HIGH 2
+#define DHT_FIRST_LOW 3
+#define DHT_BIT_HIGH 4
+#define DHT_BIT_END 5
+#define DHT_DONE 6
+
+volatile uint8_t dht_state = DHT_IDLE;
+volatile uint8_t dht_count = 0;
+volatile uint8_t dht_data[5] = {0};
+volatile uint16_t dht_rise_count = 0;
+
+static uint32_t clock_ms(void) {
+    uint32_t copy;
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+        copy = ms;
+    }
+    return copy;
+}
+
+static uint8_t due(uint32_t now, uint32_t since, uint32_t interval) {
+    return (uint32_t)(now - since) >= interval;
+}
+
+static void timer0_init(void) {
+    TCCR0A = (1 << WGM01);
+    TCCR0B = (1 << CS01) | (1 << CS00);
+    OCR0A = 249;
+    TCNT0 = 0;
+    TIMSK0 = (1 << OCIE0A);
+}
+
+ISR(TIMER0_COMPA_vect) {
+    ms++;
+}
+
+static void timer0_tick(void) {
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+        TCCR0B = 0;
+        TCNT0 = 0;
+        TIFR0 = (1 << OCF0A);
+        TCCR0B = (1 << CS01) | (1 << CS00);
+    }
+}
+
+/* Comunicacion UART */
+
+static void uart_init(void) {
+    UBRR0H = 0;
+    UBRR0L = (uint8_t)(F_CPU / (16UL * UART_BAUD) - 1UL);
+    UCSR0A = 0;
+    UCSR0C = (1 << UCSZ01) | (1 << UCSZ00);
+    UCSR0B = (1 << RXEN0) | (1 << TXEN0) | (1 << RXCIE0);
+}
+
+ISR(USART_RX_vect) {
+    uint8_t status = UCSR0A;
+    uint8_t received = UDR0;
+    uint8_t next = (uint8_t)((rx_head + 1) & (UART_BUF_SIZE - 1));
+
+    if ((status & ((1 << FE0) | (1 << DOR0) | (1 << UPE0))) ||
+        next == rx_tail) {
+        rx_error = 1;
+    } else {
+        rx_buffer[rx_head] = received;
+        rx_head = next;
+    }
+}
+
+ISR(USART_UDRE_vect) {
+    if (tx_tail == tx_head) {
+        UCSR0B &= ~(1 << UDRIE0);
+    } else {
+        UDR0 = tx_buffer[tx_tail];
+        tx_tail = (uint8_t)((tx_tail + 1) & (UART_BUF_SIZE - 1));
+    }
+}
+
+static void uart_send_byte(uint8_t value) {
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+        uint8_t next = (uint8_t)((tx_head + 1) & (UART_BUF_SIZE - 1));
+        if (next != tx_tail) {
+            tx_buffer[tx_head] = value;
+            tx_head = next;
+            UCSR0B |= (1 << UDRIE0);
+        }
+    }
+}
+
+static void uart_send_frame(uint8_t command, uint8_t data) {
+    uart_send_byte(FRAME_START);
+    uart_send_byte(command);
+    uart_send_byte(data);
+    uart_send_byte(command ^ data);
+    uart_send_byte(FRAME_STOP);
+}
+
+static void uart_frame_task(uint32_t now) {
+    if (frame_step && due(now, frame_start_ms, 300)) {
+        frame_step = 0;
+        uart_send_frame('N', 2);
+    }
+
+    if (rx_error) {
+        rx_error = 0;
+        frame_step = 0;
+        uart_send_frame('N', 4);
+    }
+
+    for (uint8_t i = 0; i < 8 && rx_tail != rx_head; i++) {
+        uint8_t byte = rx_buffer[rx_tail];
+        rx_tail = (uint8_t)((rx_tail + 1) & (UART_BUF_SIZE - 1));
+
+        if (frame_step == 0) {
+            if (byte == FRAME_START) {
+                frame_step = 1;
+                frame_start_ms = now;
+            }
+        } else if (frame_step == 1) {
+            frame_command = byte;
+            frame_step = 2;
+        } else if (frame_step == 2) {
+            frame_data = byte;
+            frame_step = 3;
+        } else if (frame_step == 3) {
+            frame_checksum = byte;
+            frame_step = 4;
+        } else {
+            frame_step = 0;
+            if (byte != FRAME_STOP ||
+                frame_checksum != (uint8_t)(frame_command ^ frame_data)) {
+                uart_send_frame('N', 1);
+            } else if (uart_command) {
+                uart_send_frame('N', 5);
+            } else {
+                uart_data = frame_data;
+                uart_command = frame_command;
+            }
+        }
+    }
+}
+
+static void uart_enable(void) {
+    if (PRR & (1 << PRUSART0)) {
+        PRR &= ~(1 << PRUSART0);
+        uart_init();
+        if (tx_head != tx_tail)
+            UCSR0B |= (1 << UDRIE0);
+    }
+}
+
+static void uart_disable(void) {
+    UCSR0B = 0;
+    PRR |= (1 << PRUSART0);
+    rx_head = rx_tail = tx_head = tx_tail = 0;
+    frame_step = 0;
+    uart_command = 0;
+    DDRD &= ~((1 << PD0) | (1 << PD1));
+}
+
+/* Modos de suspension */
+
+ISR(PCINT0_vect) {
+    if (!(PINB & (1 << EMERGENCY)))
+        emergency_wakeup = 1;
+}
+
+static void powerdown_enter(void) {
+    set_sleep_mode(SLEEP_MODE_PWR_DOWN);
+    cli();
+
+    if (!button_pending && !emergency_wakeup &&
+        (PIND & (1 << BUTTON)) &&
+        (PINB & (1 << EMERGENCY))) {
+        sleep_enable();
+        sei();
+        sleep_cpu();
+        sleep_disable();
+    } else {
+        sei();
+    }
+}
+
+static void idle_enter(void) {
+    set_sleep_mode(SLEEP_MODE_IDLE);
+    cli();
+
+    if (!button_pending && !uart_command &&
+        (PIND & (1 << BUTTON)) &&
+        (PINB & (1 << EMERGENCY))) {
+        sleep_enable();
+        sei();
+        sleep_cpu();
+        sleep_disable();
+    } else {
+        sei();
+    }
+}
+
+/* Main temporal para probar UART */
+int main(void) {
+    DDRB |= (1 << LED);
+    timer0_init();
+    uart_init();
+    sei();
+
+    uint32_t anterior = 0;
+
+    while (1) {
+        uint32_t now = clock_ms();
+        uart_frame_task(now);
+
+        if (uart_command) {
+            uint8_t received;
+
+            ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+                received = uart_command;
+                uart_command = 0;
+            }
+
+            uart_send_frame('K', received);
+        }
+
+        if (due(now, anterior, 200)) {
+            anterior = now;
+            PORTB ^= (1 << LED);
+        }
+    }
+}
