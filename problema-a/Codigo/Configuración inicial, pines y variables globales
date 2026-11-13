@@ -1,0 +1,46 @@
+#define F_CPU 16000000UL
+
+#include <avr/io.h>
+#include <avr/interrupt.h>
+#include <util/atomic.h>
+#include <util/delay.h>
+#include <util/twi.h>
+#include <stdint.h>
+
+#define LED PB5
+#define BUZZER PD3
+#define BUTTON PD2
+#define DHT PD4
+#define EMERGENCY PB3
+
+#define LCD_BL 0x08
+#define LCD_E 0x04
+#define LCD_RS 0x01
+
+static uint8_t lcd_address = 0x27;
+static uint8_t lcd_backlight = LCD_BL;
+static uint8_t lcd_register = 0;
+
+#define ACTIVO 0
+#define STANDBY 1
+#define APAGADO 2
+#define SEGURO 3
+
+volatile uint32_t ms = 0;
+volatile uint8_t adc_request = 0;
+volatile uint16_t adc_value = 0;
+volatile uint8_t button_pending = 0;
+volatile uint32_t button_time = 0;
+
+#define DHT_IDLE 0
+#define DHT_RESPONSE_LOW 1
+#define DHT_RESPONSE_HIGH 2
+#define DHT_FIRST_LOW 3
+#define DHT_BIT_HIGH 4
+#define DHT_BIT_END 5
+#define DHT_DONE 6
+
+volatile uint8_t dht_state = DHT_IDLE;
+volatile uint8_t dht_count = 0;
+volatile uint8_t dht_data[5] = {0};
+volatile uint16_t dht_rise_count = 0;
