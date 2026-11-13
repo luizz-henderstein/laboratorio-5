@@ -1,0 +1,118 @@
+static uint8_t lcd_init_task(uint32_t now)
+{
+	static uint8_t step = 0;
+	static uint32_t last = 0;
+
+	if (step == 0)
+	{
+		if (now < 50)
+		return 0;
+	}
+	else if (!due(now, last, 5))
+	{
+		return 0;
+	}
+
+	last = now;
+
+	if (step <= 2)
+	lcd_nibble(3);
+	else if (step == 3)
+	lcd_nibble(2);
+	else if (step == 4)
+	lcd_byte(0x28, 0);
+	else if (step == 5)
+	lcd_byte(0x0C, 0);
+	else if (step == 6)
+	lcd_byte(0x06, 0);
+	else if (step == 7)
+	lcd_byte(0x01, 0);
+	else
+	return 1;
+
+	step++;
+
+	return 0;
+}
+
+
+static void line_blank(char line[17])
+{
+	for (uint8_t i = 0; i < 16; i++)
+	line[i] = ' ';
+
+	line[16] = 0;
+}
+
+
+static void put_uint(char line[17],
+uint8_t pos,
+uint16_t value)
+{
+	char tmp[5];
+	uint8_t n = 0;
+
+	do
+	{
+		tmp[n++] =
+		(char)('0' + value % 10);
+
+		value /= 10;
+	}
+	while (value &&
+	n < sizeof(tmp));
+
+	while (n && pos < 16)
+	line[pos++] = tmp[--n];
+}
+
+
+static void lcd_task(uint32_t now,
+const char row0[17],
+const char row1[17],
+uint8_t request)
+{
+	static char a[17];
+	static char b[17];
+
+	static uint8_t active = 0;
+	static uint8_t pos = 0;
+
+	static uint32_t last = 0;
+
+	if (request && !active)
+	{
+		for (uint8_t i = 0;
+		i < 17;
+		i++)
+		{
+			a[i] = row0[i];
+			b[i] = row1[i];
+		}
+
+		pos = 0;
+		active = 1;
+	}
+
+	if (!active ||
+	!due(now, last, 1))
+	{
+		return;
+	}
+
+	last = now;
+
+	if (pos == 0)
+	lcd_byte(0x80, 0);
+	else if (pos <= 16)
+	lcd_byte((uint8_t)a[pos - 1], 1);
+	else if (pos == 17)
+	lcd_byte(0xC0, 0);
+	else if (pos <= 33)
+	lcd_byte((uint8_t)b[pos - 18], 1);
+
+	pos++;
+
+	if (pos > 33)
+	active = 0;
+}
