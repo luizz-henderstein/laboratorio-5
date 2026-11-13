@@ -1,0 +1,204 @@
+
+#define F_CPU 16000000UL
+
+#include <avr/interrupt.h>
+#include <avr/io.h>
+#include <avr/sleep.h>
+#include <avr/wdt.h>
+#include <stdint.h>
+#include <util/atomic.h>
+#include <util/delay.h>
+#include <util/twi.h>
+
+/* 1 = prueba A, 2 = prueba B */
+#ifndef WDT_TEST
+#define WDT_TEST 1
+#endif
+
+#if WDT_TEST != 1 && WDT_TEST != 2
+#error WDT_TEST debe ser 1 o 2
+#endif
+
+#define LED PB5
+#define BUZZER PD3
+#define BUTTON PD2
+#define DHT PD4
+#define EMERGENCY PB3
+
+#define LCD_BL 0x08
+#define LCD_E 0x04
+#define LCD_RS 0x01
+
+static uint8_t lcd_address = 0x27;
+static uint8_t lcd_backlight = LCD_BL;
+static uint8_t lcd_register = 0;
+
+#define UART_BAUD 9600UL
+#define FRAME_START 0x7E
+#define FRAME_STOP 0x7F
+#define UART_BUF_SIZE 32
+
+#define ACTIVO 0
+#define STANDBY 1
+#define APAGADO 2
+#define SEGURO 3
+
+volatile uint32_t ms = 0;
+volatile uint8_t adc_request = 0;
+volatile uint16_t adc_value = 0;
+volatile uint8_t button_pending = 0;
+volatile uint32_t button_time = 0;
+volatile uint8_t emergency_wakeup = 0;
+volatile uint8_t uart_command = 0;
+
+static uint8_t uart_data = 0;
+static uint8_t rx_buffer[UART_BUF_SIZE];
+static uint8_t tx_buffer[UART_BUF_SIZE];
+
+static volatile uint8_t rx_head = 0, rx_tail = 0;
+static volatile uint8_t tx_head = 0, tx_tail = 0;
+static volatile uint8_t rx_error = 0;
+
+static uint8_t frame_step = 0;
+static uint8_t frame_command = 0;
+static uint8_t frame_data = 0;
+static uint8_t frame_checksum = 0;
+static uint32_t frame_start_ms = 0;
+static uint8_t lcd_cancel_requested = 0;
+
+volatile uint8_t wdt_pending = 0;
+volatile uint8_t wdt_count = 0;
+uint16_t wdt_adc_value = 0;
+
+uint8_t reset_cause __attribute__((section(".noinit")));
+
+void capture_reset_cause(void)
+__attribute__((naked, section(".init3")));
+
+void capture_reset_cause(void) {
+    reset_cause = MCUSR;
+    MCUSR = 0;
+    wdt_disable();
+}
+
+#if WDT_TEST == 1
+
+static void wdt_interrupt_start(void) {
+    uint8_t sreg = SREG;
+    cli();
+    wdt_reset();
+    MCUSR &= ~(1 << WDRF);
+
+    __asm__ __volatile__(
+        "sts %[wdt], %[open]"
+        "\n\t"
+        "sts %[wdt], %[mode]"
+        :
+        : [wdt] "n"(_SFR_MEM_ADDR(WDTCSR)),
+          [open] "r"((uint8_t)((1 << WDCE) | (1 << WDE))),
+          [mode] "r"((uint8_t)((1 << WDIE) | (1 << WDP3) | (1 << WDP0)))
+        : "memory"
+    );
+
+    SREG = sreg;
+}
+
+ISR(WDT_vect) {
+    wdt_count++;
+    wdt_pending = 1;
+}
+
+static uint16_t wdt_read_adc0(void) {
+    PRR &= ~(1 << PRADC);
+    ADMUX = (1 << REFS0);
+
+    ADCSRA = (1 << ADEN) |
+             (1 << ADPS2) |
+             (1 << ADPS1) |
+             (1 << ADPS0);
+
+    ADCSRA |= (1 << ADSC);
+
+    while (ADCSRA & (1 << ADSC)) {
+    }
+
+    uint16_t value = ADC;
+
+    ADCSRA &= ~(1 << ADEN);
+    PRR |= (1 << PRADC);
+
+    return value;
+}
+
+#endif
+
+#define DHT_IDLE 0
+#define DHT_RESPONSE_LOW 1
+#define DHT_RESPONSE_HIGH 2
+#define DHT_FIRST_LOW 3
+#define DHT_BIT_HIGH 4
+#define DHT_BIT_END 5
+#define DHT_DONE 6
+
+volatile uint8_t dht_state = DHT_IDLE;
+volatile uint8_t dht_count = 0;
+volatile uint8_t dht_data[5] = {0};
+volatile uint16_t dht_rise_count = 0;
+
+static uint32_t clock_ms(void) {
+    uint32_t copy;
+
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+        copy = ms;
+    }
+
+    return copy;
+}
+
+static uint8_t due(uint32_t now,
+                   uint32_t since,
+                   uint32_t interval) {
+    return (uint32_t)(now - since) >= interval;
+}
+
+static void timer0_init(void) {
+    TCCR0A = (1 << WGM01);
+    TCCR0B = (1 << CS01) | (1 << CS00);
+
+    OCR0A = 249;
+    TCNT0 = 0;
+
+    TIMSK0 = (1 << OCIE0A);
+}
+
+ISR(TIMER0_COMPA_vect) {
+    ms++;
+}
+
+static void timer0_tick(void) {
+    ATOMIC_BLOCK(ATOMIC_RESTORESTATE) {
+        TCCR0B = 0;
+        TCNT0 = 0;
+        TIFR0 = (1 << OCF0A);
+        TCCR0B = (1 << CS01) | (1 << CS00);
+    }
+}
+
+/* Prueba inicial */
+int main(void) {
+    DDRB |= (1 << LED);
+
+    timer0_init();
+    sei();
+
+    uint32_t anterior = 0;
+
+    while (1) {
+        uint32_t now = clock_ms();
+
+        if (due(now, anterior, 200)) {
+            anterior = now;
+            PORTB ^= (1 << LED);
+        }
+    }
+}
