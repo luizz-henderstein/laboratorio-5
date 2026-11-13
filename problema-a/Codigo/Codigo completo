@@ -1,0 +1,795 @@
+#define F_CPU 16000000UL
+
+#include <avr/io.h>
+#include <avr/interrupt.h>
+#include <util/atomic.h>
+#include <util/delay.h>
+#include <util/twi.h>
+#include <stdint.h>
+
+#define LED PB5
+#define BUZZER PD3
+#define BUTTON PD2
+#define DHT PD4
+#define EMERGENCY PB3
+
+#define LCD_BL 0x08
+#define LCD_E 0x04
+#define LCD_RS 0x01
+
+static uint8_t lcd_address = 0x27;
+static uint8_t lcd_backlight = LCD_BL;
+static uint8_t lcd_register = 0;
+
+#define ACTIVO 0
+#define STANDBY 1
+#define APAGADO 2
+#define SEGURO 3
+
+volatile uint32_t ms = 0;
+volatile uint8_t adc_request = 0;
+volatile uint16_t adc_value = 0;
+volatile uint8_t button_pending = 0;
+volatile uint32_t button_time = 0;
+
+#define DHT_IDLE 0
+#define DHT_RESPONSE_LOW 1
+#define DHT_RESPONSE_HIGH 2
+#define DHT_FIRST_LOW 3
+#define DHT_BIT_HIGH 4
+#define DHT_BIT_END 5
+#define DHT_DONE 6
+
+volatile uint8_t dht_state = DHT_IDLE;
+volatile uint8_t dht_count = 0;
+volatile uint8_t dht_data[5] = {0};
+volatile uint16_t dht_rise_count = 0;
+
+
+static uint32_t clock_ms(void)
+{
+	uint32_t copy;
+
+	ATOMIC_BLOCK(ATOMIC_RESTORESTATE)
+	{
+		copy = ms;
+	}
+
+	return copy;
+}
+
+
+static uint8_t due(uint32_t now, uint32_t since, uint32_t interval)
+{
+	return (uint32_t)(now - since) >= interval;
+}
+
+
+static void timer0_init(void)
+{
+	TCCR0A = (1 << WGM01);
+	TCCR0B = (1 << CS01) | (1 << CS00);
+
+	OCR0A = 249;
+	TCNT0 = 0;
+
+	TIMSK0 = (1 << OCIE0A);
+}
+
+
+ISR(TIMER0_COMPA_vect)
+{
+	ms++;
+}
+
+
+static void timer1_init(void)
+{
+	TCCR1A = 0;
+
+	TCCR1B = (1 << WGM12) | (1 << CS11) | (1 << CS10);
+
+	OCR1A = 24999;
+	TCNT1 = 0;
+
+	TIMSK1 = (1 << OCIE1A);
+}
+
+
+ISR(TIMER1_COMPA_vect)
+{
+	adc_request = 1;
+}
+
+
+static void adc_init(void)
+{
+	ADMUX = (1 << REFS0);
+
+	ADCSRA = (1 << ADEN) | (1 << ADIE) | (1 << ADPS2) | (1 << ADPS1) |(1 << ADPS0);
+
+	DIDR0 = (1 << ADC0D);
+}
+
+
+ISR(ADC_vect)
+{
+	adc_value = ADC;
+}
+
+
+static void button_init(void)
+{
+	DDRD &= ~(1 << BUTTON);
+	PORTD |= (1 << BUTTON);
+	EICRA = (1 << ISC01);
+	EIFR = (1 << INTF0);
+	EIMSK = (1 << INT0);
+}
+
+
+ISR(INT0_vect)
+{
+	if (!button_pending)
+	{
+		button_time = ms;
+		button_pending = 1;
+	}
+}
+
+
+static uint8_t twi_wait(void)
+{
+	uint16_t timeout = 20000;
+	while (!(TWCR & (1 << TWINT)) && timeout)
+		timeout--;
+	return timeout != 0;
+}
+
+static void twi_stop(void)
+{
+	TWCR = (1 << TWINT) | (1 << TWSTO) | (1 << TWEN);
+}
+
+static uint8_t twi_start_address(uint8_t address)
+{
+	TWCR = (1 << TWINT) | (1 << TWSTA) | (1 << TWEN);
+	if (!twi_wait())
+		return 0;
+	uint8_t status = TWSR & 0xF8;
+	if (status != TW_START && status != TW_REP_START)
+	{
+		twi_stop();
+		return 0;
+	}
+	TWDR = (uint8_t)(address << 1);
+	TWCR = (1 << TWINT) | (1 << TWEN);
+	if (!twi_wait())
+	{
+		twi_stop();
+		return 0;
+	}
+	if ((TWSR & 0xF8) != TW_MT_SLA_ACK)
+	{
+		twi_stop();
+		return 0;
+	}
+	return 1;
+}
+
+static uint8_t twi_send(uint8_t value)
+{
+	TWDR = value;
+	TWCR = (1 << TWINT) | (1 << TWEN);
+	if (!twi_wait())
+		return 0;
+	return (TWSR & 0xF8) == TW_MT_DATA_ACK;
+}
+
+static void lcd_write_expander(uint8_t a, uint8_t b, uint8_t c)
+{
+	if (!twi_start_address(lcd_address))
+		return;
+	if (twi_send(a) && twi_send(b))
+		(void)twi_send(c);
+	twi_stop();
+}
+
+static void lcd_nibble(uint8_t x)
+{
+	uint8_t pins = (uint8_t)((x << 4) | lcd_register | lcd_backlight);
+	lcd_write_expander(pins, (uint8_t)(pins | LCD_E), pins);
+}
+
+static void lcd_byte(uint8_t value, uint8_t data)
+{
+	lcd_register = data ? LCD_RS : 0;
+	lcd_nibble(value >> 4);
+	lcd_nibble(value & 15);
+}
+
+static void lcd_backlight_set(uint8_t on)
+{
+	lcd_backlight = on ? LCD_BL : 0;
+	lcd_write_expander(lcd_backlight, lcd_backlight, lcd_backlight);
+}
+
+static void lcd_init_pins(void)
+{
+	DDRC &= ~((1 << PC4) | (1 << PC5));
+	PORTC |= (1 << PC4) | (1 << PC5);
+	TWSR = 0;
+	TWBR = 72;
+	TWCR = (1 << TWEN);
+	if (!twi_start_address(0x27))
+	{
+		if (twi_start_address(0x3F))
+			lcd_address = 0x3F;
+	}
+	twi_stop();
+	lcd_register = 0;
+	lcd_backlight_set(1);
+}
+
+
+static uint8_t lcd_init_task(uint32_t now)
+{
+	static uint8_t step = 0;
+	static uint32_t last = 0;
+
+	if (step == 0)
+	{
+		if (now < 50)
+		return 0;
+	}
+	else if (!due(now, last, 5))
+	{
+		return 0;
+	}
+
+	last = now;
+
+	if (step <= 2)
+	lcd_nibble(3);
+	else if (step == 3)
+	lcd_nibble(2);
+	else if (step == 4)
+	lcd_byte(0x28, 0);
+	else if (step == 5)
+	lcd_byte(0x0C, 0);
+	else if (step == 6)
+	lcd_byte(0x06, 0);
+	else if (step == 7)
+	lcd_byte(0x01, 0);
+	else
+	return 1;
+
+	step++;
+
+	return 0;
+}
+
+
+static void line_blank(char line[17])
+{
+	for (uint8_t i = 0; i < 16; i++)
+	line[i] = ' ';
+
+	line[16] = 0;
+}
+
+
+static void put_uint(char line[17],
+uint8_t pos,
+uint16_t value)
+{
+	char tmp[5];
+	uint8_t n = 0;
+
+	do
+	{
+		tmp[n++] =
+		(char)('0' + value % 10);
+
+		value /= 10;
+	}
+	while (value &&
+	n < sizeof(tmp));
+
+	while (n && pos < 16)
+	line[pos++] = tmp[--n];
+}
+
+
+static void lcd_task(uint32_t now,
+const char row0[17],
+const char row1[17],
+uint8_t request)
+{
+	static char a[17];
+	static char b[17];
+
+	static uint8_t active = 0;
+	static uint8_t pos = 0;
+
+	static uint32_t last = 0;
+
+	if (request && !active)
+	{
+		for (uint8_t i = 0;
+		i < 17;
+		i++)
+		{
+			a[i] = row0[i];
+			b[i] = row1[i];
+		}
+
+		pos = 0;
+		active = 1;
+	}
+
+	if (!active ||
+	!due(now, last, 1))
+	{
+		return;
+	}
+
+	last = now;
+
+	if (pos == 0)
+	lcd_byte(0x80, 0);
+	else if (pos <= 16)
+	lcd_byte((uint8_t)a[pos - 1], 1);
+	else if (pos == 17)
+	lcd_byte(0xC0, 0);
+	else if (pos <= 33)
+	lcd_byte((uint8_t)b[pos - 18], 1);
+
+	pos++;
+
+	if (pos > 33)
+	active = 0;
+}
+
+
+static void dht_init(void)
+{
+	DDRD &= ~(1 << DHT);
+	PORTD |= (1 << DHT);
+
+	PCICR |= (1 << PCIE2);
+	PCMSK2 &= ~(1 << PCINT20);
+}
+
+
+static uint16_t timer1_elapsed(
+uint16_t now,
+uint16_t before)
+{
+	if (now >= before)
+	return now - before;
+
+	return (uint16_t)
+	(25000U - before + now);
+}
+
+
+ISR(PCINT2_vect) //Detecta los cambios de señal del DHT11	
+{
+	uint8_t high = (PIND & (1 << DHT)) != 0;
+	uint16_t t = TCNT1;
+	if (dht_state == DHT_RESPONSE_LOW && !high)
+	{
+		dht_state = DHT_RESPONSE_HIGH;
+	}
+	else if (dht_state == DHT_RESPONSE_HIGH && high)
+	{
+		dht_state = DHT_FIRST_LOW;
+	}
+	else if (dht_state == DHT_FIRST_LOW && !high)
+	{
+		dht_state = DHT_BIT_HIGH;
+	}
+	else if (dht_state == DHT_BIT_HIGH && high)
+	{
+		dht_rise_count = t;
+		dht_state = DHT_BIT_END;
+	}
+	else if (dht_state == DHT_BIT_END && !high)
+	{
+		uint16_t ticks = timer1_elapsed(t, dht_rise_count);
+		uint8_t byte_index = dht_count / 8;
+		dht_data[byte_index] <<= 1;
+		if (ticks > 12) dht_data[byte_index] |= 1;
+		dht_count++;
+		if (dht_count == 40)
+		{
+			PCMSK2 &= ~(1 << PCINT20);
+			dht_state = DHT_DONE;
+		}
+		else
+		{
+			dht_state = DHT_BIT_HIGH;
+		}
+	}
+}
+
+
+static void dht_task(
+uint32_t now,
+uint8_t *temp,
+uint8_t *valid,
+uint8_t enabled)
+{
+	static uint8_t phase = 0;
+
+	static uint32_t last_start = 0;
+	static uint32_t start_low = 0;
+	static uint32_t start_receive = 0;
+
+	if (!enabled)
+	{
+		PCMSK2 &= ~(1 << PCINT20);
+
+		DDRD &= ~(1 << DHT);
+		PORTD |= (1 << DHT);
+
+		dht_state = DHT_IDLE;
+		phase = 0;
+
+		return;
+	}
+
+	if (phase == 0 && due(now, last_start, 2000))
+	{
+		last_start = now;
+		start_low = now;
+
+		PORTD &= ~(1 << DHT);
+		DDRD |= (1 << DHT);
+
+		phase = 1;
+	}
+	else if (phase == 1 && due(now, start_low, 20))
+	{
+		ATOMIC_BLOCK(
+		ATOMIC_RESTORESTATE)
+		{
+			dht_count = 0;
+
+			for (uint8_t i = 0;
+			i < 5;
+			i++)
+			{
+				dht_data[i] = 0;
+			}
+
+			dht_state =
+			DHT_RESPONSE_LOW;
+
+			PCIFR = (1 << PCIF2);
+			PCMSK2 |= (1 << PCINT20);
+
+			DDRD &= ~(1 << DHT);
+			PORTD |= (1 << DHT);
+		}
+
+		start_receive = now;
+		phase = 2;
+	}
+	else if (phase == 2)
+	{
+		uint8_t state;
+
+		ATOMIC_BLOCK(ATOMIC_RESTORESTATE)
+		{
+			state = dht_state;
+		}
+
+		if (state == DHT_DONE)
+		{
+			uint8_t data[5];
+
+			ATOMIC_BLOCK(ATOMIC_RESTORESTATE)
+			{
+				for (uint8_t i = 0; i < 5; i++)
+				{
+					data[i] = dht_data[i];
+				}
+
+				dht_state = DHT_IDLE;
+			}
+
+			if ((uint8_t)
+			(data[0] + data[1] + data[2] + data[3]) == data[4])
+			{
+				*temp = data[2];
+				*valid = 1;
+			}
+			else
+			{
+				*valid = 0;
+			}
+
+			phase = 0;
+		}
+		else if (due(now, start_receive, 10))
+		{
+			ATOMIC_BLOCK(ATOMIC_RESTORESTATE)
+			{
+				PCMSK2 &= ~(1 << PCINT20);
+
+				dht_state = DHT_IDLE;
+			}
+
+			*valid = 0;
+			phase = 0;
+		}
+	}
+}
+
+
+int main(void)
+{
+	uint32_t last_led = 0;
+	uint32_t last_lcd = 0;
+	uint32_t buzzer_start = 0;
+	uint32_t last_activity = 0;
+
+	uint8_t lcd_ready = 0;
+	uint8_t buzzer_on = 0;
+	uint8_t button_armed = 1;
+
+	uint8_t state = ACTIVO;
+	uint8_t previous_state = 255;
+
+	uint8_t temperature = 0;
+	uint8_t temperature_valid = 0;
+
+	char row0[17];
+	char row1[17];
+
+	line_blank(row0);
+	line_blank(row1);
+
+	DDRB |= (1 << LED);
+
+	DDRB &= ~(1 << EMERGENCY);
+	PORTB |= (1 << EMERGENCY);
+
+	DDRD |= (1 << BUZZER);
+
+	PORTB &= ~(1 << LED);
+	PORTD &= ~(1 << BUZZER);
+
+	lcd_init_pins();
+	dht_init();
+	adc_init();
+	button_init();
+	timer0_init();
+	timer1_init();
+
+	sei();
+
+	while (1)
+	{
+		uint32_t now = clock_ms();
+
+		uint8_t valid_button = 0;
+
+		uint8_t emergency =
+		!(PINB & (1 << EMERGENCY));
+
+		if (PIND & (1 << BUTTON))
+		button_armed = 1;
+
+		uint8_t pending;
+		uint32_t pressed_at;
+
+		ATOMIC_BLOCK(ATOMIC_RESTORESTATE)
+		{
+			pending = button_pending;
+			pressed_at = button_time;
+		}
+
+		if (pending && due(now, pressed_at, 25))
+		{
+			ATOMIC_BLOCK(ATOMIC_RESTORESTATE)
+			{
+				button_pending = 0;
+			}
+
+			if (button_armed && !(PIND & (1 << BUTTON)))
+			{
+				button_armed = 0;
+				valid_button = 1;
+			}
+		}
+
+		if (emergency)
+		{
+			state = SEGURO;
+		}
+		else if (state != SEGURO && valid_button)
+		{
+			last_activity = now;
+			state = ACTIVO;
+
+			PORTD |= (1 << BUZZER);
+
+			buzzer_start = now;
+			buzzer_on = 1;
+		}
+		else if (
+		state == ACTIVO && due(now, last_activity, 10000))
+		{
+			state = STANDBY;
+		}
+		else if (
+		state == STANDBY && due(now, last_activity, 30000))
+		{
+			state = APAGADO;
+		}
+
+		if (state != previous_state)
+		{
+			if (state == ACTIVO)
+			{
+				ADCSRA |= (1 << ADEN);
+
+				TCNT1 = 0;
+
+				TCCR1B =
+				(1 << WGM12) |
+				(1 << CS11) |
+				(1 << CS10);
+
+				TIMSK1 |=
+				(1 << OCIE1A);
+
+				lcd_backlight_set(1);
+				if (lcd_ready)
+				lcd_byte(0x0C, 0);
+
+				last_led = now;
+				last_lcd = now - 500;
+			}
+			else
+			{
+				TIMSK1 &= ~(1 << OCIE1A);
+
+				TCCR1B = 0;
+
+				ADCSRA &= ~(1 << ADEN);
+
+				adc_request = 0;
+
+				PORTB &= ~(1 << LED);
+				PORTD &= ~(1 << BUZZER);
+
+				buzzer_on = 0;
+
+				dht_task(now, &temperature, &temperature_valid, 0);
+
+				if (state == APAGADO)
+				{
+					lcd_byte(0x08, 0);
+					lcd_backlight_set(0);
+				}
+				else
+				{
+					lcd_backlight_set(1);
+					lcd_byte(0x0C, 0);
+
+					last_lcd = now - 500;
+				}
+			}
+
+			previous_state = state;
+		}
+
+		if (state == ACTIVO && due(now, last_led, 200))
+		{
+			last_led += 200;
+
+			PORTB ^= (1 << LED);
+		}
+
+		if (state == ACTIVO && adc_request)
+		{
+			ATOMIC_BLOCK(ATOMIC_RESTORESTATE)
+			{
+				adc_request = 0;
+			}
+
+			if (!(ADCSRA & (1 << ADSC)))
+			{
+				ADCSRA |= (1 << ADSC);
+			}
+		}
+
+		if (buzzer_on && due(now, buzzer_start, 200))
+		{
+			PORTD &= ~(1 << BUZZER);
+			buzzer_on = 0;
+		}
+
+		if (state == ACTIVO)
+		{
+			dht_task(now, &temperature, &temperature_valid, 1);
+		}
+
+		if (!lcd_ready)
+		{
+			lcd_ready = lcd_init_task(now);
+		}
+		else if (state != APAGADO)
+		{
+			uint8_t refresh = 0;
+
+			if (due(now, last_lcd, 500))
+			{
+				uint16_t adc_copy;
+
+				last_lcd += 500;
+
+				line_blank(row0);
+				line_blank(row1);
+
+				if (state == ACTIVO)
+				{
+					ATOMIC_BLOCK(ATOMIC_RESTORESTATE)
+					{
+						adc_copy = adc_value;
+					}
+
+					row0[0] = 'A';
+					row0[1] = 'D';
+					row0[2] = 'C';
+					row0[3] = ':';
+
+					put_uint(row0, 5, adc_copy);
+
+					row1[0] = 'T';
+					row1[1] = 'e';
+					row1[2] = 'm';
+					row1[3] = 'p';
+					row1[4] = ':';
+
+					if (temperature_valid)
+					{
+						put_uint(row1, 6, temperature);
+						row1[10] = 'C';
+					}
+					else
+					{
+						row1[6] = '-';
+						row1[7] = '-';
+					}
+				}
+				else if (state == STANDBY)
+				{
+					const char message[] = "Esperando...";
+
+					for (uint8_t i = 0; message[i] != 0; i++)
+					{
+						row0[i] = message[i];
+					}
+				}
+				else if (state == SEGURO)
+				{
+					const char message[] = "EMERGENCIA";
+
+					for (uint8_t i = 0; message[i] != 0; i++)
+					{
+						row0[i] = message[i];
+					}
+				}
+
+				refresh = 1;
+			}
+
+			lcd_task(now, row0, row1, refresh);
+		}
+	}
+}
