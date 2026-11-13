@@ -1,0 +1,264 @@
+int main(void)
+{
+	uint32_t last_led = 0;
+	uint32_t last_lcd = 0;
+	uint32_t buzzer_start = 0;
+	uint32_t last_activity = 0;
+
+	uint8_t lcd_ready = 0;
+	uint8_t buzzer_on = 0;
+	uint8_t button_armed = 1;
+
+	uint8_t state = ACTIVO;
+	uint8_t previous_state = 255;
+
+	uint8_t temperature = 0;
+	uint8_t temperature_valid = 0;
+
+	char row0[17];
+	char row1[17];
+
+	line_blank(row0);
+	line_blank(row1);
+
+	DDRB |= (1 << LED);
+
+	DDRB &= ~(1 << EMERGENCY);
+	PORTB |= (1 << EMERGENCY);
+
+	DDRD |= (1 << BUZZER);
+
+	PORTB &= ~(1 << LED);
+	PORTD &= ~(1 << BUZZER);
+
+	lcd_init_pins();
+	dht_init();
+	adc_init();
+	button_init();
+	timer0_init();
+	timer1_init();
+
+	sei();
+
+	while (1)
+	{
+		uint32_t now = clock_ms();
+
+		uint8_t valid_button = 0;
+
+		uint8_t emergency =
+		!(PINB & (1 << EMERGENCY));
+
+		if (PIND & (1 << BUTTON))
+		button_armed = 1;
+
+		uint8_t pending;
+		uint32_t pressed_at;
+
+		ATOMIC_BLOCK(ATOMIC_RESTORESTATE)
+		{
+			pending = button_pending;
+			pressed_at = button_time;
+		}
+
+		if (pending && due(now, pressed_at, 25))
+		{
+			ATOMIC_BLOCK(ATOMIC_RESTORESTATE)
+			{
+				button_pending = 0;
+			}
+
+			if (button_armed && !(PIND & (1 << BUTTON)))
+			{
+				button_armed = 0;
+				valid_button = 1;
+			}
+		}
+
+		if (emergency)
+		{
+			state = SEGURO;
+		}
+		else if (state != SEGURO && valid_button)
+		{
+			last_activity = now;
+			state = ACTIVO;
+
+			PORTD |= (1 << BUZZER);
+
+			buzzer_start = now;
+			buzzer_on = 1;
+		}
+		else if (
+		state == ACTIVO && due(now, last_activity, 10000))
+		{
+			state = STANDBY;
+		}
+		else if (
+		state == STANDBY && due(now, last_activity, 30000))
+		{
+			state = APAGADO;
+		}
+
+		if (state != previous_state)
+		{
+			if (state == ACTIVO)
+			{
+				ADCSRA |= (1 << ADEN);
+
+				TCNT1 = 0;
+
+				TCCR1B =
+				(1 << WGM12) |
+				(1 << CS11) |
+				(1 << CS10);
+
+				TIMSK1 |=
+				(1 << OCIE1A);
+
+				lcd_backlight_set(1);
+				if (lcd_ready)
+				lcd_byte(0x0C, 0);
+
+				last_led = now;
+				last_lcd = now - 500;
+			}
+			else
+			{
+				TIMSK1 &= ~(1 << OCIE1A);
+
+				TCCR1B = 0;
+
+				ADCSRA &= ~(1 << ADEN);
+
+				adc_request = 0;
+
+				PORTB &= ~(1 << LED);
+				PORTD &= ~(1 << BUZZER);
+
+				buzzer_on = 0;
+
+				dht_task(now, &temperature, &temperature_valid, 0);
+
+				if (state == APAGADO)
+				{
+					lcd_byte(0x08, 0);
+					lcd_backlight_set(0);
+				}
+				else
+				{
+					lcd_backlight_set(1);
+					lcd_byte(0x0C, 0);
+
+					last_lcd = now - 500;
+				}
+			}
+
+			previous_state = state;
+		}
+
+		if (state == ACTIVO && due(now, last_led, 200))
+		{
+			last_led += 200;
+
+			PORTB ^= (1 << LED);
+		}
+
+		if (state == ACTIVO && adc_request)
+		{
+			ATOMIC_BLOCK(ATOMIC_RESTORESTATE)
+			{
+				adc_request = 0;
+			}
+
+			if (!(ADCSRA & (1 << ADSC)))
+			{
+				ADCSRA |= (1 << ADSC);
+			}
+		}
+
+		if (buzzer_on && due(now, buzzer_start, 200))
+		{
+			PORTD &= ~(1 << BUZZER);
+			buzzer_on = 0;
+		}
+
+		if (state == ACTIVO)
+		{
+			dht_task(now, &temperature, &temperature_valid, 1);
+		}
+
+		if (!lcd_ready)
+		{
+			lcd_ready = lcd_init_task(now);
+		}
+		else if (state != APAGADO)
+		{
+			uint8_t refresh = 0;
+
+			if (due(now, last_lcd, 500))
+			{
+				uint16_t adc_copy;
+
+				last_lcd += 500;
+
+				line_blank(row0);
+				line_blank(row1);
+
+				if (state == ACTIVO)
+				{
+					ATOMIC_BLOCK(ATOMIC_RESTORESTATE)
+					{
+						adc_copy = adc_value;
+					}
+
+					row0[0] = 'A';
+					row0[1] = 'D';
+					row0[2] = 'C';
+					row0[3] = ':';
+
+					put_uint(row0, 5, adc_copy);
+
+					row1[0] = 'T';
+					row1[1] = 'e';
+					row1[2] = 'm';
+					row1[3] = 'p';
+					row1[4] = ':';
+
+					if (temperature_valid)
+					{
+						put_uint(row1, 6, temperature);
+						row1[10] = 'C';
+					}
+					else
+					{
+						row1[6] = '-';
+						row1[7] = '-';
+					}
+				}
+				else if (state == STANDBY)
+				{
+					const char message[] = "Esperando...";
+
+					for (uint8_t i = 0; message[i] != 0; i++)
+					{
+						row0[i] = message[i];
+					}
+				}
+				else if (state == SEGURO)
+				{
+					const char message[] = "EMERGENCIA";
+
+					for (uint8_t i = 0; message[i] != 0; i++)
+					{
+						row0[i] = message[i];
+					}
+				}
+
+				refresh = 1;
+			}
+
+			lcd_task(now, row0, row1, refresh);
+		}
+	}
+}
