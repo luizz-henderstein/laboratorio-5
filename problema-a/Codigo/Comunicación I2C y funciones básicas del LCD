@@ -1,0 +1,92 @@
+static uint8_t twi_wait(void)
+{
+	uint16_t timeout = 20000;
+	while (!(TWCR & (1 << TWINT)) && timeout)
+		timeout--;
+	return timeout != 0;
+}
+
+static void twi_stop(void)
+{
+	TWCR = (1 << TWINT) | (1 << TWSTO) | (1 << TWEN);
+}
+
+static uint8_t twi_start_address(uint8_t address)
+{
+	TWCR = (1 << TWINT) | (1 << TWSTA) | (1 << TWEN);
+	if (!twi_wait())
+		return 0;
+	uint8_t status = TWSR & 0xF8;
+	if (status != TW_START && status != TW_REP_START)
+	{
+		twi_stop();
+		return 0;
+	}
+	TWDR = (uint8_t)(address << 1);
+	TWCR = (1 << TWINT) | (1 << TWEN);
+	if (!twi_wait())
+	{
+		twi_stop();
+		return 0;
+	}
+	if ((TWSR & 0xF8) != TW_MT_SLA_ACK)
+	{
+		twi_stop();
+		return 0;
+	}
+	return 1;
+}
+
+static uint8_t twi_send(uint8_t value)
+{
+	TWDR = value;
+	TWCR = (1 << TWINT) | (1 << TWEN);
+	if (!twi_wait())
+		return 0;
+	return (TWSR & 0xF8) == TW_MT_DATA_ACK;
+}
+
+static void lcd_write_expander(uint8_t a, uint8_t b, uint8_t c)
+{
+	if (!twi_start_address(lcd_address))
+		return;
+	if (twi_send(a) && twi_send(b))
+		(void)twi_send(c);
+	twi_stop();
+}
+
+static void lcd_nibble(uint8_t x)
+{
+	uint8_t pins = (uint8_t)((x << 4) | lcd_register | lcd_backlight);
+	lcd_write_expander(pins, (uint8_t)(pins | LCD_E), pins);
+}
+
+static void lcd_byte(uint8_t value, uint8_t data)
+{
+	lcd_register = data ? LCD_RS : 0;
+	lcd_nibble(value >> 4);
+	lcd_nibble(value & 15);
+}
+
+static void lcd_backlight_set(uint8_t on)
+{
+	lcd_backlight = on ? LCD_BL : 0;
+	lcd_write_expander(lcd_backlight, lcd_backlight, lcd_backlight);
+}
+
+static void lcd_init_pins(void)
+{
+	DDRC &= ~((1 << PC4) | (1 << PC5));
+	PORTC |= (1 << PC4) | (1 << PC5);
+	TWSR = 0;
+	TWBR = 72;
+	TWCR = (1 << TWEN);
+	if (!twi_start_address(0x27))
+	{
+		if (twi_start_address(0x3F))
+			lcd_address = 0x3F;
+	}
+	twi_stop();
+	lcd_register = 0;
+	lcd_backlight_set(1);
+}
