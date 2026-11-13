@@ -1,0 +1,54 @@
+static uint32_t clock_ms(void)
+{
+	uint32_t copy;
+
+	ATOMIC_BLOCK(ATOMIC_RESTORESTATE)
+	{
+		copy = ms;
+	}
+
+	return copy;
+}
+
+
+static uint8_t due(uint32_t now, uint32_t since, uint32_t interval)
+{
+	return (uint32_t)(now - since) >= interval;
+}
+
+
+static void timer0_init(void)
+{
+	TCCR0A = (1 << WGM01);
+	TCCR0B = (1 << CS01) | (1 << CS00);
+
+	OCR0A = 249;
+	TCNT0 = 0;
+
+	TIMSK0 = (1 << OCIE0A);
+}
+
+
+ISR(TIMER0_COMPA_vect)
+{
+	ms++;
+}
+
+
+static void timer1_init(void)
+{
+	TCCR1A = 0;
+
+	TCCR1B = (1 << WGM12) | (1 << CS11) | (1 << CS10);
+
+	OCR1A = 24999;
+	TCNT1 = 0;
+
+	TIMSK1 = (1 << OCIE1A);
+}
+
+
+ISR(TIMER1_COMPA_vect)
+{
+	adc_request = 1;
+}
